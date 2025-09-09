@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+from typing import Callable
 import unittest
 
 import torch
@@ -234,6 +235,301 @@ class TestDot(RefEagerTestBase, TestCase):
         # Ensure debug assertions and safe sigmoid casting are present in codegen
         self.assertIn("tl.static_assert", code)
         self.assertIn("tl.sigmoid(tl.cast", code)
+
+    def _test_small_dims(self, m_dim, k_dim, n_dim, combine_func, check_code=False):
+        @helion.kernel(use_default_config=True)
+        def mm_small_dims(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            combine: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = combine(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc
+            return out
+
+        x = torch.randn(m_dim, k_dim, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k_dim, n_dim, device=DEVICE, dtype=torch.bfloat16)
+
+        if check_code:
+            code, result = code_and_output(mm_small_dims, (x, y, combine_func))
+            self.assertExpectedJournal(code)
+        else:
+            result = mm_small_dims(x, y, combine_func)
+
+        expected = torch.matmul(x, y).to(torch.float32)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-3)
+
+    def _test_reshape_m_1(self, combine_func):
+        """Test matrix multiplication with M=1 created through reshape."""
+        @helion.kernel(use_default_config=True)
+        def mm_reshape_m_1(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            combine: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> torch.Tensor:
+            # x is a vector that we reshape to have M=1
+            k = x.size(0)
+            x_reshaped = x.view(1, k)  # M=1, K=k
+            
+            k2, n = y.size()
+            assert k == k2
+            
+            out = torch.zeros(1, n, dtype=torch.float32, device=x.device)
+            
+            # Only tile over the N dimension; use ':' for the size-1 M dim
+            for tile_n in hl.tile(n):
+                acc = hl.zeros([1, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = combine(acc, x_reshaped[:, tile_k], y[tile_k, tile_n])
+                out[:, tile_n] = acc
+            
+            return out.view(n)  # Reshape back to vector
+        
+        k, n = 32, 64
+        x = torch.randn(k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        
+        result = mm_reshape_m_1(x, y, combine_func)
+        expected = (x.view(1, k) @ y).view(n).to(torch.float32)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-3)
+
+    def _test_reshape_n_1(self, combine_func):
+        """Test matrix multiplication with N=1 created through reshape."""
+        @helion.kernel(use_default_config=True)
+        def mm_reshape_n_1(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            combine: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> torch.Tensor:
+            m, k = x.size()
+            
+            # y is a vector that we reshape to have N=1
+            k2 = y.size(0)
+            assert k == k2
+            y_reshaped = y.view(k, 1)  # K=k, N=1
+            
+            out = torch.zeros(m, 1, dtype=torch.float32, device=x.device)
+            
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, 1], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = combine(acc, x[tile_m, tile_k], y_reshaped[tile_k, :])
+                out[tile_m, :] = acc
+            
+            return out.view(m)  # Reshape back to vector
+        
+        m, k = 64, 32
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k, device=DEVICE, dtype=torch.bfloat16)
+        
+        result = mm_reshape_n_1(x, y, combine_func)
+        expected = (x @ y.view(k, 1)).view(m).to(torch.float32)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-3)
+
+    def _test_reshape_k_1(self, combine_func):
+        """Test matrix multiplication with K=1 created through reshape."""
+        @helion.kernel(use_default_config=True)
+        def mm_reshape_k_1(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            combine: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> torch.Tensor:
+            # x is a vector reshaped to have K=1
+            m = x.size(0)
+            x_reshaped = x.view(m, 1)  # M=m, K=1
+            
+            # y is a vector reshaped to have K=1
+            n = y.size(0)
+            y_reshaped = y.view(1, n)  # K=1, N=n
+            
+            out = torch.zeros(m, n, dtype=torch.float32, device=x.device)
+            
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                # K is 1; don't tile it — slice with ':'
+                acc = combine(acc, x_reshaped[tile_m, :], y_reshaped[:, tile_n])
+                out[tile_m, tile_n] = acc
+            
+            return out
+        
+        m, n = 64, 32
+        x = torch.randn(m, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+        
+        result = mm_reshape_k_1(x, y, combine_func)
+        expected = (x.view(m, 1) @ y.view(1, n)).to(torch.float32)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-3)
+
+    def test_hl_dot_small_m_dim(self):
+        """Test hl.dot with M=2 which is smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=2, k_dim=32, n_dim=64, combine_func=lambda acc, a, b: hl.dot(a, b, acc=acc))
+
+    def test_hl_dot_small_n_dim(self):
+        """Test hl.dot with N=3 which is smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=64, n_dim=3, combine_func=lambda acc, a, b: hl.dot(a, b, acc=acc))
+
+    def test_hl_dot_small_k_dim(self):
+        """Test hl.dot with K=4 which is smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=4, n_dim=64, combine_func=lambda acc, a, b: hl.dot(a, b, acc=acc))
+
+    def test_hl_dot_multiple_small_dims(self):
+        """Test hl.dot with multiple dims smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=5, k_dim=6, n_dim=7, combine_func=lambda acc, a, b: hl.dot(a, b, acc=acc), check_code=True)
+
+    def test_addmm_small_m_dim(self):
+        """Test torch.addmm with M=2 smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=2, k_dim=32, n_dim=64, combine_func=torch.addmm)
+
+    def test_addmm_small_n_dim(self):
+        """Test torch.addmm with N=3 smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=64, n_dim=3, combine_func=torch.addmm)
+
+    def test_addmm_small_k_dim(self):
+        """Test torch.addmm with K=4 smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=4, n_dim=64, combine_func=torch.addmm)
+
+    def test_addmm_multiple_small_dims(self):
+        """Test torch.addmm with multiple dims smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=5, k_dim=6, n_dim=7, combine_func=torch.addmm, check_code=True)
+    
+    def test_addmm_reshape_m_1(self):
+        """Test torch.addmm with M=1 created through reshape."""
+        self._test_reshape_m_1(torch.addmm)
+    
+    def test_addmm_reshape_n_1(self):
+        """Test torch.addmm with N=1 created through reshape."""
+        self._test_reshape_n_1(torch.addmm)
+    
+    def test_addmm_reshape_k_1(self):
+        """Test torch.addmm with K=1 created through reshape."""
+        self._test_reshape_k_1(torch.addmm)
+    
+    def test_hl_dot_reshape_m_1(self):
+        """Test hl.dot with M=1 created through reshape."""
+        self._test_reshape_m_1(lambda acc, a, b: hl.dot(a, b, acc=acc))
+    
+    def test_hl_dot_reshape_n_1(self):
+        """Test hl.dot with N=1 created through reshape."""
+        self._test_reshape_n_1(lambda acc, a, b: hl.dot(a, b, acc=acc))
+    
+    def test_hl_dot_reshape_k_1(self):
+        """Test hl.dot with K=1 created through reshape."""
+        self._test_reshape_k_1(lambda acc, a, b: hl.dot(a, b, acc=acc))
+
+    # torch.mm tests
+    def test_mm_small_m_dim(self):
+        """Test torch.mm with M=2 smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=2, k_dim=32, n_dim=64, combine_func=lambda acc, a, b: acc + torch.mm(a, b))
+
+    def test_mm_small_n_dim(self):
+        """Test torch.mm with N=3 smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=64, n_dim=3, combine_func=lambda acc, a, b: acc + torch.mm(a, b))
+
+    def test_mm_small_k_dim(self):
+        """Test torch.mm with K=4 smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=4, n_dim=64, combine_func=lambda acc, a, b: acc + torch.mm(a, b))
+
+    def test_mm_multiple_small_dims(self):
+        """Test torch.mm with multiple dims smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=5, k_dim=6, n_dim=7, combine_func=lambda acc, a, b: acc + torch.mm(a, b), check_code=True)
+
+    def test_mm_reshape_m_1(self):
+        """Test torch.mm with M=1 created through reshape."""
+        self._test_reshape_m_1(lambda acc, a, b: acc + torch.mm(a, b))
+
+    def test_mm_reshape_n_1(self):
+        """Test torch.mm with N=1 created through reshape."""
+        self._test_reshape_n_1(lambda acc, a, b: acc + torch.mm(a, b))
+
+    def test_mm_reshape_k_1(self):
+        """Test torch.mm with K=1 created through reshape."""
+        self._test_reshape_k_1(lambda acc, a, b: acc + torch.mm(a, b))
+
+    # torch.matmul tests
+    def test_matmul_small_m_dim(self):
+        """Test torch.matmul with M=2 smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=2, k_dim=32, n_dim=64, combine_func=lambda acc, a, b: acc + torch.matmul(a, b))
+
+    def test_matmul_small_n_dim(self):
+        """Test torch.matmul with N=3 smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=64, n_dim=3, combine_func=lambda acc, a, b: acc + torch.matmul(a, b))
+
+    def test_matmul_small_k_dim(self):
+        """Test torch.matmul with K=4 smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=32, k_dim=4, n_dim=64, combine_func=lambda acc, a, b: acc + torch.matmul(a, b))
+
+    def test_matmul_multiple_small_dims(self):
+        """Test torch.matmul with multiple dims smaller than the minimum of 16 for tl.dot."""
+        self._test_small_dims(m_dim=5, k_dim=6, n_dim=7, combine_func=lambda acc, a, b: acc + torch.matmul(a, b), check_code=True)
+
+    def test_matmul_reshape_m_1(self):
+        """Test torch.matmul with M=1 created through reshape."""
+        self._test_reshape_m_1(lambda acc, a, b: acc + torch.matmul(a, b))
+
+    def test_matmul_reshape_n_1(self):
+        """Test torch.matmul with N=1 created through reshape."""
+        self._test_reshape_n_1(lambda acc, a, b: acc + torch.matmul(a, b))
+
+    def test_matmul_reshape_k_1(self):
+        """Test torch.matmul with K=1 created through reshape."""
+        self._test_reshape_k_1(lambda acc, a, b: acc + torch.matmul(a, b))
+
+    # Helper method for torch.bmm tests
+    def _test_bmm_small_dims(self, batch_dim, m_dim, k_dim, n_dim, check_code=False):
+        """Test batch matrix multiplication with small dimensions."""
+        @helion.kernel(use_default_config=True)
+        def bmm_small_dims(
+            x: torch.Tensor,
+            y: torch.Tensor,
+        ) -> torch.Tensor:
+            batch, m, k = x.size()
+            _, _, n = y.size()
+            out = torch.zeros(batch, m, n, dtype=torch.float32, device=x.device)
+            
+            # Iterate over batch dimension
+            for b in hl.tile(batch):
+                # For each batch slice, compute matrix multiplication
+                out[b, :, :] = torch.bmm(x[b, :, :], y[b, :, :]).to(torch.float32)
+            return out
+
+        x = torch.randn(batch_dim, m_dim, k_dim, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(batch_dim, k_dim, n_dim, device=DEVICE, dtype=torch.bfloat16)
+
+        if check_code:
+            code, result = code_and_output(bmm_small_dims, (x, y))
+            self.assertExpectedJournal(code)
+        else:
+            result = bmm_small_dims(x, y)
+
+        expected = torch.bmm(x, y).to(torch.float32)
+        torch.testing.assert_close(result, expected, rtol=2e-2, atol=2e-2)
+
+    # torch.bmm tests
+    def test_bmm_small_m_dim(self):
+        """Test torch.bmm with M=2 smaller than the minimum of 16 for tl.dot."""
+        self._test_bmm_small_dims(batch_dim=4, m_dim=2, k_dim=32, n_dim=64)
+
+    def test_bmm_small_n_dim(self):
+        """Test torch.bmm with N=3 smaller than the minimum of 16 for tl.dot."""
+        self._test_bmm_small_dims(batch_dim=4, m_dim=32, k_dim=64, n_dim=3)
+
+    def test_bmm_small_k_dim(self):
+        """Test torch.bmm with K=4 smaller than the minimum of 16 for tl.dot."""
+        self._test_bmm_small_dims(batch_dim=4, m_dim=32, k_dim=4, n_dim=64)
+
+    def test_bmm_multiple_small_dims(self):
+        """Test torch.bmm with multiple dims smaller than the minimum of 16 for tl.dot."""
+        self._test_bmm_small_dims(batch_dim=2, m_dim=5, k_dim=6, n_dim=7, check_code=True)
+
+    def test_bmm_small_batch_dim(self):
+        """Test torch.bmm with small batch dimension."""
+        self._test_bmm_small_dims(batch_dim=1, m_dim=32, k_dim=64, n_dim=128)
 
 
 # Define ref mode test failures
