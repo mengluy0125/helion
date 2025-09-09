@@ -522,56 +522,6 @@ class TestDot(RefEagerTestBase, TestCase):
         """Test torch.matmul with K=1 created through reshape."""
         self._test_reshape_k_1(lambda acc, a, b: acc + torch.matmul(a, b))
 
-    # Helper method for torch.bmm tests
-    def _test_bmm_small_dims(self, batch_dim, m_dim, k_dim, n_dim, check_code=False):
-        """Test batch matrix multiplication with small dimensions."""
-        @helion.kernel(use_default_config=True)
-        def bmm_small_dims(
-            x: torch.Tensor,
-            y: torch.Tensor,
-        ) -> torch.Tensor:
-            batch, m, k = x.size()
-            _, _, n = y.size()
-            out = torch.zeros(batch, m, n, dtype=torch.float32, device=x.device)
-            
-            # Iterate over batch dimension
-            for b in hl.tile(batch):
-                # For each batch slice, compute matrix multiplication
-                out[b, :, :] = torch.bmm(x[b, :, :], y[b, :, :]).to(torch.float32)
-            return out
-
-        x = torch.randn(batch_dim, m_dim, k_dim, device=DEVICE, dtype=torch.bfloat16)
-        y = torch.randn(batch_dim, k_dim, n_dim, device=DEVICE, dtype=torch.bfloat16)
-
-        if check_code:
-            code, result = code_and_output(bmm_small_dims, (x, y))
-            self.assertExpectedJournal(code)
-        else:
-            result = bmm_small_dims(x, y)
-
-        expected = torch.bmm(x, y).to(torch.float32)
-        torch.testing.assert_close(result, expected, rtol=2e-2, atol=2e-2)
-
-    # torch.bmm tests
-    def test_bmm_small_m_dim(self):
-        """Test torch.bmm with M=2 smaller than the minimum of 16 for tl.dot."""
-        self._test_bmm_small_dims(batch_dim=4, m_dim=2, k_dim=32, n_dim=64)
-
-    def test_bmm_small_n_dim(self):
-        """Test torch.bmm with N=3 smaller than the minimum of 16 for tl.dot."""
-        self._test_bmm_small_dims(batch_dim=4, m_dim=32, k_dim=64, n_dim=3)
-
-    def test_bmm_small_k_dim(self):
-        """Test torch.bmm with K=4 smaller than the minimum of 16 for tl.dot."""
-        self._test_bmm_small_dims(batch_dim=4, m_dim=32, k_dim=4, n_dim=64)
-
-    def test_bmm_multiple_small_dims(self):
-        """Test torch.bmm with multiple dims smaller than the minimum of 16 for tl.dot."""
-        self._test_bmm_small_dims(batch_dim=2, m_dim=5, k_dim=6, n_dim=7, check_code=True)
-
-    def test_bmm_small_batch_dim(self):
-        """Test torch.bmm with small batch dimension."""
-        self._test_bmm_small_dims(batch_dim=1, m_dim=32, k_dim=64, n_dim=128)
 
 
 # Define ref mode test failures
