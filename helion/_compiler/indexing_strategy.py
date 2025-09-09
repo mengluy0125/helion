@@ -495,6 +495,14 @@ class SubscriptIndexing(NamedTuple):
             ):
                 input_size.popleft()
                 output_size.extend(k.size())
+            elif isinstance(k, torch.Tensor) and k.ndim > 1 and len(index) > 1:
+                # Advanced indexing across multiple dimensions when combined with
+                # other indices (e.g., integer, slice, tile indexers). Consume one
+                # input dimension and splice the full indexer shape into the output
+                # shape. This mirrors PyTorch semantics and enables patterns like
+                #  B[cols_3d[:, :, :], tile_p[:, None, None, :, None], ...].
+                input_size.popleft()
+                output_size.extend(k.size())
             else:
                 raise exc.InvalidIndexingType(k)
         assert len(input_size) == 0, "invalid subscript"
@@ -514,6 +522,43 @@ class SubscriptIndexing(NamedTuple):
         output_size = SubscriptIndexing.compute_shape(fake_value, index)
         env = CompileEnvironment.current()
         dtype = env.triton_index_type()
+        # If we see a multi-dim tensor indexer, we will broadcast the final
+        # combined mask to the computed block shape. For simpler cases, avoid
+        # broadcasting to keep generated code minimal and stable.
+        need_mask_broadcast = False
+
+        def _multi_expand_str(start: int, span: int) -> str:
+            # Build a broadcast bracket that covers a contiguous span of output
+            # dimensions [start, start+span). We merge expand_str() tokens for
+            # each covered dim so that ':' survives wherever any covered dim
+            # uses that compacted axis (and 'None' appears otherwise).
+            base = tile_strategy.expand_str(output_size, start)
+            if base == "":
+                # Single-dim degenerate, no broadcast needed
+                return base
+            assert base.startswith("[") and base.endswith("]"), base
+            tokens = base[1:-1].split(", ") if len(base) > 2 else []
+            # Merge with other dims
+            for j in range(start + 1, start + span):
+                s = tile_strategy.expand_str(output_size, j)
+                if s == "":
+                    # result would be just ':'; treat as a single ':' bracket
+                    s_tokens = [":"]
+                else:
+                    assert s.startswith("[") and s.endswith("]"), s
+                    s_tokens = s[1:-1].split(", ") if len(s) > 2 else []
+                # unify token list lengths (they should match)
+                assert len(tokens) == len(s_tokens) or len(tokens) == 0 or len(s_tokens) == 0
+                if not tokens:
+                    tokens = s_tokens
+                elif s_tokens:
+                    tokens = [
+                        ":" if (a == ":" or b == ":") else "None"
+                        for a, b in zip(tokens, s_tokens, strict=True)
+                    ]
+            if tokens == [":"]:
+                return ""
+            return f"[{', '.join(tokens)}]"
         for n, k in enumerate(index):
             if k is None:
                 output_idx += 1
@@ -601,6 +646,30 @@ class SubscriptIndexing(NamedTuple):
                         mask_values.setdefault(
                             f"({mask}){tile_strategy.expand_str(output_size, n)}"
                         )
+            elif isinstance(k, torch.Tensor) and k.ndim > 1 and len(index) > 1:
+                # Multi-dimensional tensor indexer combined with other indices.
+                # Instead of emitting one expression per contributed dim, lift the
+                # indexer once and apply a single merged broadcast bracket covering
+                # its k.ndim output dims. This avoids reshapes and keeps the AST
+                # compact and deterministic.
+                ast_index = state.ast_args[1]
+                assert isinstance(ast_index, (list, tuple))
+                assert len(ast_index) == len(index)
+                index_var = state.codegen.lift(ast_index[n], prefix="index").id
+                start = output_idx
+                bracket = _multi_expand_str(start, k.ndim)
+                index_values.append(f"({index_var}){bracket}")
+                # Add a per-dim mask contribution for each of the output dims
+                # introduced by this indexer, so they get conjoined below.
+                for d in range(k.ndim):
+                    if (block_idx := env.get_block_id(output_size[start + d])) is not None:
+                        if mask := state.codegen.mask_var(block_idx):
+                            mask_values.setdefault(
+                                f"({mask}){tile_strategy.expand_str(output_size, start + d)}"
+                            )
+                # Consume k.ndim output dimensions contributed by this index tensor
+                output_idx += k.ndim
+                need_mask_broadcast = True
             else:
                 raise exc.InvalidIndexingType(type(k))
         assert len(output_size) == output_idx
@@ -618,9 +687,20 @@ class SubscriptIndexing(NamedTuple):
         if extra_mask is not None:
             mask_values.setdefault("{_extra_mask}")
             kwargs["_extra_mask"] = extra_mask
+
+        # Build mask AST and, only if needed, broadcast to the final block shape
+        raw_mask = expr_from_string("&".join(mask_values) or "None", **kwargs)
+        if need_mask_broadcast and not (
+            isinstance(raw_mask, ast.Constant) and raw_mask.value is None
+        ):
+            shape = tile_strategy.shape_str(output_size)
+            mask_ast = expr_from_string(f"tl.broadcast_to({{mask}}, {shape})", mask=raw_mask)
+        else:
+            mask_ast = raw_mask
+
         return SubscriptIndexing(
             expr_from_string("+".join(index_expr)),
-            expr_from_string("&".join(mask_values) or "None", **kwargs),
+            mask_ast,
         )
 
 

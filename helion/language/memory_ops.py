@@ -207,6 +207,20 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
+        # Fast-path for tile_index(...) being broadcast-only indexed.
+        # In the common pattern of using only broadcast decorations (None or full slices)
+        # on the tile_index result, we can reuse the pre-existing AST of the tile_index
+        # call directly and let the broadcast brackets be added outside.
+        from ..language import tile_index
+        tensor_node = state.fx_node.args[0]
+        if (
+            isinstance(tensor_node, torch.fx.Node)
+            and tensor_node.op == "call_function"
+            and tensor_node.target == tile_index
+        ):
+            if all(idx is None or isinstance(idx, slice) for idx in subscript):
+                return state.ast_args[0]
+
         return state.device_function.indexing_strategy.codegen_load(
             state, tensor, [*subscript], extra_mask
         )

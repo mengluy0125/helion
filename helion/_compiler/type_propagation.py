@@ -459,9 +459,16 @@ class TensorType(TypeInfo):
             elif isinstance(k, TileIndexType):
                 inputs_consumed += 1
                 output_sizes.append(env.block_sizes[k.block_id].var)
-            elif isinstance(k, TensorType) and k.fake_value.ndim == 1:
+            elif isinstance(k, TensorType):
+                # Advanced indexing with a tensor indexer.
+                # Semantics (PyTorch-like): a tensor indexer consumes exactly one
+                # base/input dimension and contributes all of its own dimensions
+                # to the output shape, in-order. This supports both 1D and
+                # multi-dimensional indexers and matches patterns like
+                #   B[cols_3d[:, :, :], tile_p[:, None, None, :, None], ...]
+                # where cols_3d is rank-3 and mixed with other indices.
                 inputs_consumed += 1
-                output_sizes.append(k.fake_value.size(0))
+                output_sizes.extend(list(k.fake_value.size()))
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:
@@ -1047,6 +1054,8 @@ class TileIndexType(TypeInfo):
         if isinstance(getattr(Tile, attr, None), property):
             return TypeInfo.from_example(getattr(self.proxy(), attr), origin)
         return super().propagate_attribute(attr, origin)
+
+    # Note: tile[...] sugar is no longer supported; use tile.index[...] instead.
 
 
 class GridIndexType(SymIntType):

@@ -142,6 +142,30 @@ class CompileEnvironment:
             if rdim.reduction and rdim.size == size:
                 return rdim
 
+        # Check if size matches any tile dimension for symbolic equality.
+        # When building expressions that mix sizes derived from tiles
+        # (e.g., via slicing) with sizes coming directly from tile block vars, we
+        # want them to share the same SymInt variable whenever they are equal by
+        # construction. This preserves equality in the shape environment and avoids
+        # spurious "size mismatch" issues during fake-tensor broadcasting and
+        # arithmetic in type propagation.
+        if isinstance(size, torch.SymInt):
+            size_str = str(size)
+            for block_info in self.block_sizes:
+                if not block_info.reduction and str(block_info.var) == size_str:
+                    # Create reduction dimension with the same var to preserve
+                    # symbolic equality and ensure all later users see identical
+                    # symbols (rather than equal-but-distinct SymInts).
+                    rdim_idx = self.allocate_block_size(
+                        size,
+                        reduction=True,
+                        source=ReductionLoopBlockSizeSource(
+                            reduction_loop=len([b for b in self.block_sizes if b.reduction])
+                        ),
+                    )
+                    self.block_sizes[rdim_idx].var = block_info.var
+                    return self.block_sizes[rdim_idx]
+
         # Allocate a new reduction dimension
         rdim_idx = self.allocate_block_size(
             size,
