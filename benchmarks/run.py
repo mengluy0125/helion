@@ -126,7 +126,7 @@ KERNEL_MAPPINGS: dict[str, tuple[str, ...]] = {  # pyright: ignore[reportAssignm
     "layer_norm": (
         "tritonbench.operators.layer_norm.operator",
         "examples.layer_norm",
-        "layer_norm_fwd",
+        "layer_norm_autograd",
     ),
     "jagged_softmax": (
         "tritonbench.operators.jagged_softmax.operator",

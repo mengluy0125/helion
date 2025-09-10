@@ -417,6 +417,9 @@ def run_example(
     baseline_name: str = "torch",
     rtol: float = 1e-2,
     atol: float = 1e-1,
+    bwd: bool = False,
+    bwd_rtol: float | None = None,
+    bwd_atol: float | None = None,
 ) -> None:
     """Run complete example: correctness check + benchmark.
 
@@ -428,6 +431,9 @@ def run_example(
         baseline_name: Name for single baseline in output (default: "torch")
         rtol: Relative tolerance for correctness check (default: 1e-2)
         atol: Absolute tolerance for correctness check (default: 1e-1)
+        bwd: Whether to also test backward pass (default: False)
+        bwd_rtol: Relative tolerance for backward pass (default: same as rtol)
+        bwd_atol: Absolute tolerance for backward pass (default: same as atol)
     """
     torch.set_float32_matmul_precision("high")
 
@@ -436,6 +442,12 @@ def run_example(
     baselines = (
         baseline_fn if isinstance(baseline_fn, dict) else {baseline_name: baseline_fn}
     )
+
+    # Set backward tolerances if not specified
+    if bwd_rtol is None:
+        bwd_rtol = rtol
+    if bwd_atol is None:
+        bwd_atol = atol
 
     # Check correctness against first baseline
     first_baseline_name, first_baseline_func = next(iter(baselines.items()))
@@ -450,6 +462,62 @@ def run_example(
                 rtol=rtol,
                 atol=atol,
             )
+
+    # Test backward pass if requested
+    if bwd:
+        print(f"\n{'=' * 65}\nBackward Pass Testing\n{'=' * 65}", file=sys.stderr)
+
+        # Find tensors that require gradients in args
+        grad_tensors = []
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and arg.requires_grad:
+                grad_tensors.append(arg)
+
+        if not grad_tensors:
+            print(
+                "Warning: No tensors with requires_grad=True found in args",
+                file=sys.stderr,
+            )
+        else:
+            # Run baseline backward pass
+            baseline_out = first_baseline_func(*args)
+            grad_output = torch.randn_like(baseline_out)
+
+            # Save original gradients
+            baseline_out.backward(grad_output, retain_graph=True)
+            baseline_grads = [
+                t.grad.clone() if t.grad is not None else None for t in grad_tensors
+            ]
+
+            # Clear gradients
+            for t in grad_tensors:
+                t.grad = None
+
+            # Test each implementation
+            for name, func in {**kernels, **baselines}.items():
+                if name != first_baseline_name:
+                    print(f"Testing {name} backward correctness...", file=sys.stderr)
+
+                    # Run backward
+                    out = func(*args)
+                    out.backward(grad_output, retain_graph=True)
+
+                    # Compare gradients
+                    for i, (tensor, baseline_grad) in enumerate(
+                        zip(grad_tensors, baseline_grads, strict=False)
+                    ):
+                        if baseline_grad is not None and tensor.grad is not None:
+                            torch.testing.assert_close(
+                                tensor.grad.to(torch.float32),
+                                baseline_grad.to(torch.float32),
+                                rtol=bwd_rtol,
+                                atol=bwd_atol,
+                                msg=f"Gradient mismatch for tensor {i} in {name}",
+                            )
+
+                    # Clear gradients for next test
+                    for t in grad_tensors:
+                        t.grad = None
 
     # Benchmark all functions
     all_times = {
