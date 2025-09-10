@@ -109,6 +109,58 @@ def prepare_node_lowering(
     graph_lowering: GraphLowering,
     node: Node,
 ) -> None:
+    # Early broadcast compatibility check for binary pointwise ops to ensure
+    # user-friendly ShapeMismatch before codegen/compile.
+    def _early_check_broadcast(node: Node) -> None:
+        import torch
+        from .. import exc as _exc
+        # Only check common binary ops
+        binary_targets = {
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.sub.Tensor,
+            torch.ops.aten.mul.Tensor,
+            torch.ops.aten.div.Tensor,
+        }
+        if node.target not in binary_targets:
+            return
+        # Collect tensor inputs
+        inputs: list[torch.Tensor] = []
+        def visit(n: Node) -> Node:
+            val = n.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                inputs.append(val)
+            return n
+        map_arg((node.args, node.kwargs), visit)
+        if len(inputs) < 2:
+            return
+        # Right-align shapes
+        shapes = [[*t.size()] for t in inputs]
+        max_rank = max((len(s) for s in shapes), default=0)
+        for i, s in enumerate(shapes):
+            pad = max_rank - len(s)
+            if pad > 0:
+                shapes[i] = [1] * pad + s
+        # Numeric mismatch among non-1 sizes is an error
+        env = CompileEnvironment.current()
+        for dim in range(max_rank):
+            non_ones: list[int | torch.SymInt] = [s[dim] for s in shapes if s[dim] != 1]
+            if not non_ones:
+                continue
+            nums: list[int] = []
+            for sz in non_ones:
+                if isinstance(sz, int):
+                    nums.append(sz)
+                else:
+                    try:
+                        nums.append(env.size_hint(sz))
+                    except Exception:
+                        nums.append(-1)
+            if len(set(nums)) > 1:
+                raise _exc.ShapeMismatch(str(shapes[0]), ", ".join(map(str, shapes[1:])))
+
+    # Run early binary broadcast check before dispatching lowerings
+    _early_check_broadcast(node)
+
     if is_api_func(api := node.target):
         APIFuncLowering.normalize_args_kwargs(api, node)
         node.meta["lowering"] = APIFuncLowering(api)
@@ -522,36 +574,35 @@ class PointwiseLowering(InductorLowering):
 
         # Check each dimension independently
         for dim in range(max_rank):
-            # First, see if multiple distinct block-ids appear in this dim
+            # Gather non-1 sizes for this dim
+            non_one_sizes: list[int | torch.SymInt] = [s[dim] for s in shapes if not is_one(s[dim])]
+            if not non_one_sizes:
+                continue
+            # If multiple distinct block-ids appear, likely a mismatch unless numerically equal
             block_ids: set[int] = set()
-            for s in shapes:
-                size_i = s[dim]
-                if is_one(size_i):
-                    continue
+            for size_i in non_one_sizes:
                 block_id = env.get_block_id(size_i)
                 if block_id is not None:
                     block_ids.add(block_id)
-            if len(block_ids) >= 2:
-                raise exc.ShapeMismatch(
-                    str(shapes[0]),
-                    ", ".join(map(str, shapes[1:])),
-                )
-
-            # Otherwise, fall back to strict symbolic inequality among non-1 sizes
-            exprs: set[object] = set()
-            for s in shapes:
-                size_i = s[dim]
-                if is_one(size_i):
-                    continue
-                if isinstance(size_i, torch.SymInt):
-                    exprs.add(size_i._sympy_())
+            size_vals: list[int] = []
+            for size_i in non_one_sizes:
+                if isinstance(size_i, int):
+                    size_vals.append(size_i)
                 else:
-                    exprs.add(size_i)
-            if len(exprs) >= 2:
+                    try:
+                        size_vals.append(env.size_hint(size_i))
+                    except Exception:
+                        # Unknown size: treat as distinct to be conservative
+                        size_vals.append(-1)
+            # If there are at least two distinct concrete sizes, it's a mismatch
+            if len(set(size_vals)) > 1:
                 raise exc.ShapeMismatch(
                     str(shapes[0]),
                     ", ".join(map(str, shapes[1:])),
                 )
+            # Otherwise, sizes are numerically equal; allow (even if block_ids differ)
+
+            # If numerically equal, allow even if symbols differ
 
 
 @dataclasses.dataclass

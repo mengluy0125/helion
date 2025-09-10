@@ -266,17 +266,16 @@ def _helion_test(col, B, val, C, B_stride_0, B_stride_1, B_stride_2, C_stride_0,
     indices_3 = (offset_3 + tl.arange(0, _BLOCK_SIZE_3)).to(tl.int32)
     mask_3 = indices_3 < Q
     acc = tl.full([_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3], 0.0, tl.float32)
-    for offset_4 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_4):
-        indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
-        mask_4 = indices_4 < K
+    for offset_5 in tl.range(0, K.to(tl.int32), _BLOCK_SIZE_4):
+        indices_5 = offset_5 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
+        mask_4 = indices_5 < K
         acc_copy = acc
         acc_copy_0 = acc_copy
-        cols_3d = tl.load(col + (indices_0[:, None, None] * col_stride_0 + indices_1[None, :, None] * col_stride_1 + indices_4[None, None, :] * col_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_4[None, None, :], other=0)
-        subscript = cols_3d[:, :, :]
-        B_slice = tl.load(B + (subscript[:, :, :, None, None] * B_stride_0 + indices_2[None, None, None, :, None] * B_stride_1 + indices_3[None, None, None, None, :] * B_stride_2), tl.broadcast_to(mask_0[:, None, None, None, None] & mask_1[None, :, None, None, None] & mask_4[None, None, :, None, None] & mask_2[None, None, None, :, None] & mask_3[None, None, None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_4, _BLOCK_SIZE_2, _BLOCK_SIZE_3]), other=0)
-        vals_3d = tl.load(val + (indices_0[:, None, None] * val_stride_0 + indices_1[None, :, None] * val_stride_1 + indices_4[None, None, :] * val_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_4[None, None, :], other=0)
-        subscript_1 = vals_3d[:, :, :, None, None]
-        v_0 = subscript_1 * B_slice
+        cols_3d = tl.load(col + (indices_0[:, None, None] * col_stride_0 + indices_1[None, :, None] * col_stride_1 + indices_5[None, None, :] * col_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_4[None, None, :], other=0)
+        B_slice = tl.load(B + (cols_3d[:, :, :, None, None] * B_stride_0 + indices_2[None, None, None, :, None] * B_stride_1 + indices_3[None, None, None, None, :] * B_stride_2), tl.broadcast_to(mask_0[:, None, None, None, None] & mask_1[None, :, None, None, None] & mask_4[None, None, :, None, None] & mask_2[None, None, None, :, None] & mask_3[None, None, None, None, :], [_BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_4, _BLOCK_SIZE_2, _BLOCK_SIZE_3]), other=0)
+        vals_3d = tl.load(val + (indices_0[:, None, None] * val_stride_0 + indices_1[None, :, None] * val_stride_1 + indices_5[None, None, :] * val_stride_2), mask_0[:, None, None] & mask_1[None, :, None] & mask_4[None, None, :], other=0)
+        subscript = vals_3d[:, :, :, None, None]
+        v_0 = subscript * B_slice
         contrib_1 = tl.cast(tl.sum(v_0, 2), tl.float32)
         acc = acc_copy_0 + contrib_1
     tl.store(C + (indices_0[:, None, None, None] * C_stride_0 + indices_1[None, :, None, None] * C_stride_1 + indices_2[None, None, :, None] * C_stride_2 + indices_3[None, None, None, :] * C_stride_3), acc, mask_0[:, None, None, None] & mask_1[None, :, None, None] & mask_2[None, None, :, None] & mask_3[None, None, None, :])
@@ -291,6 +290,7 @@ def test(col: torch.Tensor, val: torch.Tensor, B: torch.Tensor, *, _launcher=_de
     _BLOCK_SIZE_2 = 4
     _BLOCK_SIZE_3 = 4
     _BLOCK_SIZE_4 = 4
+    _RDIM_SIZE_5 = triton.next_power_of_2(_BLOCK_SIZE_2)
     _launcher(_helion_test, (triton.cdiv(M, _BLOCK_SIZE_0) * triton.cdiv(N, _BLOCK_SIZE_1) * triton.cdiv(P, _BLOCK_SIZE_2) * triton.cdiv(Q, _BLOCK_SIZE_3),), col, B, val, C, B.stride(0), B.stride(1), B.stride(2), C.stride(0), C.stride(1), C.stride(2), C.stride(3), col.stride(0), col.stride(1), col.stride(2), val.stride(0), val.stride(1), val.stride(2), M, N, P, Q, K, _BLOCK_SIZE_0, _BLOCK_SIZE_1, _BLOCK_SIZE_2, _BLOCK_SIZE_3, _BLOCK_SIZE_4, num_warps=4, num_stages=3)
     return C
 

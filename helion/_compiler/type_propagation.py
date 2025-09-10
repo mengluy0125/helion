@@ -461,14 +461,25 @@ class TensorType(TypeInfo):
                 output_sizes.append(env.block_sizes[k.block_id].var)
             elif isinstance(k, TensorType):
                 # Advanced indexing with a tensor indexer.
-                # Semantics (PyTorch-like): a tensor indexer consumes exactly one
-                # base/input dimension and contributes all of its own dimensions
-                # to the output shape, in-order. This supports both 1D and
-                # multi-dimensional indexers and matches patterns like
-                #   B[cols_3d[:, :, :], tile_p[:, None, None, :, None], ...]
-                # where cols_3d is rank-3 and mixed with other indices.
+                # Consume exactly one base dim and contribute indexer dims.
                 inputs_consumed += 1
-                output_sizes.extend(list(k.fake_value.size()))
+                dims = list(k.fake_value.size())
+                nontrivial = [
+                    d for d in dims if CompileEnvironment.current().size_hint(d) != 1
+                ]
+                if len(nontrivial) <= 1:
+                    # Prefer tile-index provenance when available to keep symbols stable.
+                    bid = CompileEnvironment.current().get_tile_index_tensor_block_id(
+                        k.fake_value
+                    )
+                    if bid is not None:
+                        output_sizes.append(
+                            CompileEnvironment.current().block_sizes[bid].var
+                        )
+                    else:
+                        output_sizes.append(nontrivial[0] if nontrivial else 1)
+                else:
+                    output_sizes.extend(dims)
             elif k.contains_type(TileIndexType):
                 raise exc.OverpackedTile(k)
             else:

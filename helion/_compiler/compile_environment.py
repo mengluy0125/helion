@@ -72,6 +72,9 @@ class CompileEnvironment:
         self.specialized_vars: set[sympy.Symbol] = set()
         self.loop_dependency_checker = LoopDependencyChecker()
         self._symint_cache: dict[object, torch.SymInt] = {}
+        # Track provenance of tile_index()-derived tensors to their block_id.
+        # Keys are id(tensor) to avoid keeping strong refs unintentionally.
+        self._tile_index_tensor_block_id: dict[int, int] = {}
 
     def add_kernel_tensor_size(self, sizes: Sequence[int | torch.SymInt]) -> None:
         from .device_function import contains_only_block_size_symbols
@@ -226,6 +229,13 @@ class CompileEnvironment:
             result = self.create_unbacked_symint(hint)
             self._symint_cache[key] = result
         return result
+
+    # --- tile_index tensor provenance helpers ---
+    def register_tile_index_tensor(self, tensor: torch.Tensor, block_id: int) -> None:
+        self._tile_index_tensor_block_id[id(tensor)] = block_id
+
+    def get_tile_index_tensor_block_id(self, tensor: torch.Tensor) -> int | None:
+        return self._tile_index_tensor_block_id.get(id(tensor))
 
     def to_fake(self, obj: object, origin: Origin) -> object:
         if isinstance(obj, torch.Tensor):
