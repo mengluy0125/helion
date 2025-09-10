@@ -47,6 +47,7 @@ from ..language._decorators import is_api_func
 from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import ExtendedAST
 from .ast_extension import create
+from .._compat import min_dot_size
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
@@ -61,6 +62,7 @@ from .node_masking import cached_masked_value
 from .node_masking import getitem_masked_value
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
+from .padding_utils import emit_tl_dot_with_small_dim_padding
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1097,72 +1099,100 @@ def reduce_3d_dot(
             ):
                 reduce_dim = True
 
-    # Match PyTorch dtype promotion for inputs: cast both operands to a common dtype when needed
+    # Common setup
+    env = CompileEnvironment.current()
+    common_dtype = torch.promote_types(lhs_dtype, rhs_dtype)
+
+    # Get dimension symbols
+    m_sym = lhs_node.meta["val"].size()[-2]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    k_sym = lhs_node.meta["val"].size()[-1]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    n_sym = rhs_node.meta["val"].size()[-1]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+    
+    # Resolve dimensions to concrete values if possible
+    def resolve_dim(v):
+        idx = env.get_block_id(v)
+        if idx is not None:
+            return env.block_sizes[idx].from_config(ctx.cg.device_function.config)
+        return int(v) if isinstance(v, int) else None
+    
+    m_val = resolve_dim(m_sym)
+    n_val = resolve_dim(n_sym)
+    k_val = resolve_dim(k_sym)
 
     if not reduce_dim:
-        # Harmonize operand dtypes using dtype promotion; force-cast both sides
-        common_dtype = torch.promote_types(lhs_dtype, rhs_dtype)
+        # Non-reduction case
         lhs_h = cast_ast(lhs, common_dtype)
         rhs_h = cast_ast(rhs, common_dtype)
-        if with_acc:
-            # If acc dtype matches the (promoted) input dtype, we can fuse via acc=
-            assert isinstance(acc, ast.AST)
-            if acc_dtype_meta == common_dtype:
-                return emit_tl_dot(
-                    lhs_h,
-                    rhs_h,
-                    input_precision=datatype,
-                    acc=acc,  # pyright: ignore[reportArgumentType]
-                )
-            # Otherwise, compute dot in input-promoted dtype and add to acc separately
-            tmp = emit_tl_dot(lhs_h, rhs_h, input_precision=datatype)
-            assert isinstance(acc_dtype_meta, torch.dtype)
-            tmp_cast = cast_ast(tmp, acc_dtype_meta)
-            # Keep compute dtype; let later ops or stores decide final cast
-            return expr_from_string("{acc} + {tmp}", acc=acc, tmp=tmp_cast)
-        # without accumulator
-        # Cast to the meta-expected dtype to match PyTorch semantics
-        expr = emit_tl_dot(lhs_h, rhs_h, input_precision=datatype)
-        desired_dtype = node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue]
-        return cast_ast(expr, desired_dtype)
 
-    # create reshape, dot, then reshape
-    lhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*lhs_node.meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    )
-    rhs_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*rhs_node.meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-    )
-    out_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-        [*node.meta["val"].size()]
-    )
-    lhs_reshape = expr_from_string(f"tl.reshape({{lhs}}, {lhs_shape_str})", lhs=lhs)
-    rhs_reshape = expr_from_string(f"tl.reshape({{rhs}}, {rhs_shape_str})", rhs=rhs)
-    # Harmonize operand dtypes (same rule as non-reduced case); force-cast both sides
-    common_dtype = torch.promote_types(lhs_dtype, rhs_dtype)
+        # Always use the padding-aware dot function - it handles the fast path internally
+        result = emit_tl_dot_with_small_dim_padding(
+            lhs_h,
+            rhs_h,
+            acc,
+            env.device,
+            lhs_dtype,
+            rhs_dtype,
+            emit_tl_dot,
+            cast_ast,
+            m=m_val,
+            n=n_val,
+            k=k_val,
+            input_precision=datatype,
+            acc_dtype=acc_dtype_meta
+            if with_acc and acc_dtype_meta != common_dtype
+            else None,
+        )
+
+        if not with_acc:
+            result = cast_ast(result, node.meta["val"].dtype)  # pyright: ignore[reportAttributeAccessIssue]
+        return result
+
+    # Reduction case - reshape to 2D
+    shapes = {
+        "lhs": ctx.cg.device_function.tile_strategy.shape_str(
+            [*lhs_node.meta["val"].size()[1:]]
+        ),  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        "rhs": ctx.cg.device_function.tile_strategy.shape_str(
+            [*rhs_node.meta["val"].size()[1:]]
+        ),  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        "out": ctx.cg.device_function.tile_strategy.shape_str(
+            [*node.meta["val"].size()]
+        ),
+    }
+
+    lhs_reshape = expr_from_string(f"tl.reshape({{lhs}}, {shapes['lhs']})", lhs=lhs)
+    rhs_reshape = expr_from_string(f"tl.reshape({{rhs}}, {shapes['rhs']})", rhs=rhs)
     lhs_reshape_h = cast_ast(lhs_reshape, common_dtype)
     rhs_reshape_h = cast_ast(rhs_reshape, common_dtype)
+
+    acc_reshape = None
     if with_acc:
-        acc_shape_str = ctx.cg.device_function.tile_strategy.shape_str(
-            [*node.args[0].meta["val"].size()[1:]]  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
-        )
-        acc_reshape = expr_from_string(f"tl.reshape({{rhs}}, {acc_shape_str})", rhs=acc)  # pyright: ignore[reportArgumentType]
-        if acc_dtype_meta == common_dtype:
-            comp = emit_tl_dot(
-                lhs_reshape_h, rhs_reshape_h, input_precision=datatype, acc=acc_reshape
-            )
-        else:
-            # Compute dot in input-promoted dtype and add to acc after reshape
-            mm = emit_tl_dot(lhs_reshape_h, rhs_reshape_h, input_precision=datatype)
-            assert isinstance(acc_dtype_meta, torch.dtype)
-            mm_cast = cast_ast(mm, acc_dtype_meta)
-            comp = expr_from_string("{acc} + {mm}", acc=acc_reshape, mm=mm_cast)
-    else:
-        comp = emit_tl_dot(lhs_reshape_h, rhs_reshape_h, input_precision=datatype)
-    # Cast reshaped result to meta-expected dtype to match PyTorch semantics
-    expr = expr_from_string(f"tl.reshape({{lhs}}, {out_shape_str})", lhs=comp)
-    desired_dtype = node.meta["val"].dtype  # pyright: ignore[reportAttributeAccessIssue]
-    return cast_ast(expr, desired_dtype)
+        acc_shape = ctx.cg.device_function.tile_strategy.shape_str(
+            [*node.args[0].meta["val"].size()[1:]]
+        )  # pyright: ignore[reportAttributeAccessIssue,reportOptionalMemberAccess]
+        acc_reshape = expr_from_string(f"tl.reshape({{rhs}}, {acc_shape})", rhs=acc)  # pyright: ignore[reportArgumentType]
+
+    # Always use the padding-aware dot function
+    comp = emit_tl_dot_with_small_dim_padding(
+        lhs_reshape_h,
+        rhs_reshape_h,
+        acc_reshape,
+        env.device,
+        lhs_dtype,
+        rhs_dtype,
+        emit_tl_dot,
+        cast_ast,
+        m=m_val,
+        n=n_val,
+        k=k_val,
+        input_precision=datatype,
+        acc_dtype=acc_dtype_meta
+        if with_acc and acc_dtype_meta != common_dtype
+        else None,
+    )
+
+    expr = expr_from_string(f"tl.reshape({{lhs}}, {shapes['out']})", lhs=comp)
+    return cast_ast(expr, node.meta["val"].dtype)  # pyright: ignore[reportAttributeAccessIssue]
 
 
 @register_lowering(torch.ops.aten.bmm.default, apply_dot_requirements)  # pyright: ignore[reportAttributeAccessIssue]
