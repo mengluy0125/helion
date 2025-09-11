@@ -446,6 +446,85 @@ class TestDot(RefEagerTestBase, TestCase):
         """Test torch.addmm with K=1 created through reshape."""
         self._test_reshape_k_1(torch.addmm)
 
+    def _test_reshape_m_2(self, combine_func):
+        """Test matrix multiplication with M=2 created through reshape."""
+        
+        @helion.kernel(use_default_config=True)
+        def mm_reshape_m_2(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            combine: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> torch.Tensor:
+            # x is a 2*k vector that we reshape to have M=2
+            k_total = x.size(0)
+            k = k_total // 2
+            x_reshaped = x.view(2, k)  # M=2, K=k
+            
+            k2, n = y.size()
+            assert k == k2
+            
+            out = torch.zeros(2, n, dtype=torch.float32, device=x.device)
+            
+            # M is 2; don't tile it — slice with ':'
+            for tile_n in hl.tile(n):
+                acc = hl.zeros([2, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = combine(acc, x_reshaped[:, tile_k], y[tile_k, tile_n])
+                out[:, tile_n] = acc
+                
+            return out.view(2 * n)  # Reshape back to vector
+            
+        k, n = 32, 64
+        x = torch.randn(2 * k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        
+        result = mm_reshape_m_2(x, y, combine_func)
+        expected = (x.view(2, k) @ y).view(2 * n).to(torch.float32)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-3)
+        
+    def _test_reshape_n_2(self, combine_func):
+        """Test matrix multiplication with N=2 created through reshape."""
+        
+        @helion.kernel(use_default_config=True)
+        def mm_reshape_n_2(
+            x: torch.Tensor,
+            y: torch.Tensor,
+            combine: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+        ) -> torch.Tensor:
+            m, k = x.size()
+            
+            # y is a 2*k vector that we reshape to have N=2
+            k_total = y.size(0)
+            k2 = k_total // 2
+            assert k == k2
+            y_reshaped = y.view(k, 2)  # K=k, N=2
+            
+            out = torch.zeros(m, 2, dtype=torch.float32, device=x.device)
+            
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, 2], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = combine(acc, x[tile_m, tile_k], y_reshaped[tile_k, :])
+                out[tile_m, :] = acc
+                
+            return out.view(m * 2)  # Reshape back to vector
+            
+        m, k = 64, 32
+        x = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(k * 2, device=DEVICE, dtype=torch.bfloat16)
+        
+        result = mm_reshape_n_2(x, y, combine_func)
+        expected = (x @ y.view(k, 2)).view(m * 2).to(torch.float32)
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-3)
+
+    def test_addmm_reshape_m_2(self):
+        """Test torch.addmm with M=2 created through reshape."""
+        self._test_reshape_m_2(torch.addmm)
+        
+    def test_addmm_reshape_n_2(self):
+        """Test torch.addmm with N=2 created through reshape."""
+        self._test_reshape_n_2(torch.addmm)
+
     def test_hl_dot_reshape_m_1(self):
         """Test hl.dot with M=1 created through reshape."""
         self._test_reshape_m_1(lambda acc, a, b: hl.dot(a, b, acc=acc))
@@ -457,6 +536,14 @@ class TestDot(RefEagerTestBase, TestCase):
     def test_hl_dot_reshape_k_1(self):
         """Test hl.dot with K=1 created through reshape."""
         self._test_reshape_k_1(lambda acc, a, b: hl.dot(a, b, acc=acc))
+
+    def test_hl_dot_reshape_m_2(self):
+        """Test hl.dot with M=2 created through reshape."""
+        self._test_reshape_m_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
+        
+    def test_hl_dot_reshape_n_2(self):
+        """Test hl.dot with N=2 created through reshape."""
+        self._test_reshape_n_2(lambda acc, a, b: hl.dot(a, b, acc=acc))
 
     # torch.mm tests
     def test_mm_small_m_dim(self):
@@ -514,6 +601,14 @@ class TestDot(RefEagerTestBase, TestCase):
         """Test torch.mm with K=1 created through reshape."""
         self._test_reshape_k_1(lambda acc, a, b: acc + torch.mm(a, b))
 
+    def test_mm_reshape_m_2(self):
+        """Test torch.mm with M=2 created through reshape."""
+        self._test_reshape_m_2(lambda acc, a, b: acc + torch.mm(a, b))
+        
+    def test_mm_reshape_n_2(self):
+        """Test torch.mm with N=2 created through reshape."""
+        self._test_reshape_n_2(lambda acc, a, b: acc + torch.mm(a, b))
+
     # torch.matmul tests
     def test_matmul_small_m_dim(self):
         """Test torch.matmul with M=2 smaller than the minimum of 16 for tl.dot."""
@@ -569,6 +664,14 @@ class TestDot(RefEagerTestBase, TestCase):
     def test_matmul_reshape_k_1(self):
         """Test torch.matmul with K=1 created through reshape."""
         self._test_reshape_k_1(lambda acc, a, b: acc + torch.matmul(a, b))
+        
+    def test_matmul_reshape_m_2(self):
+        """Test torch.matmul with M=2 created through reshape."""
+        self._test_reshape_m_2(lambda acc, a, b: acc + torch.matmul(a, b))
+        
+    def test_matmul_reshape_n_2(self):
+        """Test torch.matmul with N=2 created through reshape."""
+        self._test_reshape_n_2(lambda acc, a, b: acc + torch.matmul(a, b))
 
 
 # Define ref mode test failures
